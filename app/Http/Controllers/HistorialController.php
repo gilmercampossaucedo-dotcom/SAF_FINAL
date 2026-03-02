@@ -1,0 +1,157 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+
+use App\Models\Sale;
+use App\Models\Product;
+use App\Services\CartService;
+use Illuminate\Support\Facades\Auth;
+
+class HistorialController extends Controller
+{
+    /**
+     * Display a listing of the buyer's purchases.
+     */
+    public function index(Request $request)
+    {
+        $query = Auth::user()->purchases()
+            ->with(['details.product', 'details.talla', 'details.color', 'payments.paymentMethod']);
+
+        // Filter by estado
+        if ($request->filled('estado')) {
+            $query->where('estado', $request->estado);
+        }
+
+        // Filter by date range
+        if ($request->filled('fecha_desde')) {
+            $query->whereDate('date', '>=', $request->fecha_desde);
+        }
+        if ($request->filled('fecha_hasta')) {
+            $query->whereDate('date', '<=', $request->fecha_hasta);
+        }
+
+        // Sorting
+        match ($request->input('sort', 'newest')) {
+            'oldest' => $query->orderBy('date', 'asc'),
+            'amount' => $query->orderBy('total', 'desc'),
+            default => $query->orderBy('date', 'desc'),
+        };
+
+        $purchases = $query->paginate(10)->withQueryString();
+
+        return view('shop.historial.index', compact('purchases'));
+    }
+
+    /**
+     * Display the specified purchase details.
+     */
+    public function show(Sale $sale)
+    {
+        // Security check
+        if ($sale->buyer_id !== Auth::id()) {
+            abort(403);
+        }
+
+        $sale->load(['details.product', 'details.talla', 'details.color', 'payments.paymentMethod']);
+
+        return view('shop.historial.show', compact('sale'));
+    }
+
+    /**
+     * Repeat a past order: re-add items to cart.
+     */
+    public function repeatOrder(Sale $sale, CartService $cart)
+    {
+        // Security check
+        if ($sale->buyer_id !== Auth::id()) {
+            abort(403);
+        }
+
+        $itemsAdded = 0;
+        foreach ($sale->details as $detail) {
+            $product = $detail->product;
+            if ($product) {
+                // Verificar stock de la variante específica
+                if ($detail->talla_id || $detail->color_id) {
+                    $pt = $product->productoTallas()
+                        ->where('talla_id', $detail->talla_id)
+                        ->where('color_id', $detail->color_id)
+                        ->where('activo', true)
+                        ->first();
+
+                    if ($pt && $pt->stock > 0) {
+                        $qty = min($detail->quantity, $pt->stock);
+                        $cart->add(
+                            $product->id,
+                            $product->name,
+                            (float) $product->price,
+                            $pt->stock,
+                            $product->image,
+                            (int) $qty,
+                            $detail->talla_id,
+                            $detail->talla?->nombre,
+                            $detail->color_id,
+                            $detail->color?->name
+                        );
+                        $itemsAdded++;
+                    }
+                } else if ($product->stock > 0) {
+                    $qty = min($detail->quantity, $product->stock);
+                    $cart->add(
+                        $product->id,
+                        $product->name,
+                        (float) $product->price,
+                        $product->stock,
+                        $product->image,
+                        (int) $qty
+                    );
+                    $itemsAdded++;
+                }
+            }
+        }
+
+        if ($itemsAdded === 0) {
+            return redirect()->back()->with('error', 'No se pudieron agregar productos (sin stock).');
+        }
+
+        return redirect()->route('cart.index')->with('success', "Se han agregado {$itemsAdded} productos de tu pedido anterior.");
+    }
+
+    /**
+     * Upload Yape proof for an existing pending order.
+     */
+    public function uploadProof(Request $request, Sale $sale)
+    {
+        // Security check
+        if ($sale->buyer_id !== Auth::id()) {
+            abort(403);
+        }
+
+        // Validate
+        $request->validate([
+            'comprobante' => 'required|image|mimes:jpeg,png,jpg|max:4096'
+        ], [
+            'comprobante.required' => 'Debes adjuntar una imagen del comprobante.',
+            'comprobante.image' => 'El archivo debe ser una imagen válida.'
+        ]);
+
+        try {
+            if ($request->hasFile('comprobante')) {
+                $path = $request->file('comprobante')->store('comprobantes/yape', 'public');
+                $sale->update([
+                    'comprobante_yape' => $path,
+                    // If it was already pending_payment, it stays there but now has proof
+                ]);
+
+                return redirect()->back()->with('success', '¡Comprobante enviado con éxito! Estamos verificando tu pago.');
+            }
+        } catch (\Exception $e) {
+            return redirect()->back()->with('error', 'Error al subir el comprobante: ' . $e->getMessage());
+        }
+
+        return redirect()->back()->with('error', 'No se seleccionó ningún archivo.');
+    }
+}
